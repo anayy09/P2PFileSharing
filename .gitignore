@@ -1,0 +1,25 @@
+# Ignore compiled Java files
+*.class
+
+# Ignore package metadata
+*.jar
+*.war
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
+
+# Ignore configuration files (avoid accidental sharing of test data)
+Common.cfg
+PeerInfo.cfg
+
+# Ignore logs
+*.log
+
+# Ignore project-specific test files
+1001/
+1002/
+1003/
+1004/
+1005/
+1006/
