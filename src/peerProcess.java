@@ -11,6 +11,15 @@ public class peerProcess {
     private Map<Integer, Socket> peerConnections = new HashMap<>(); // Stores active peer connections
     private byte[] bitfield; // Bitfield added
 
+    // New Config Variables from Common.cfg
+    private int numberOfPreferredNeighbors;
+    private int unchokingInterval;
+    private int optimisticUnchokingInterval;
+    private String fileName;
+    private int fileSize;
+    private int pieceSize;
+    private int numPieces;
+
     public peerProcess(int peerID) {
         this.peerID = peerID;
     }
@@ -28,12 +37,54 @@ public class peerProcess {
     }
 
     private void initialize() {
+        parseCommonConfig(); // New: Parse Common.cfg
+        parsePeerInfo();
+    }
+
+    private void parseCommonConfig() {
+        try (BufferedReader br = new BufferedReader(new FileReader("Common.cfg"))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                String[] parts = line.split("\\s+");
+                if (parts.length != 2)
+                    continue;
+
+                switch (parts[0]) {
+                    case "NumberOfPreferredNeighbors":
+                        numberOfPreferredNeighbors = Integer.parseInt(parts[1]);
+                        break;
+                    case "UnchokingInterval":
+                        unchokingInterval = Integer.parseInt(parts[1]);
+                        break;
+                    case "OptimisticUnchokingInterval":
+                        optimisticUnchokingInterval = Integer.parseInt(parts[1]);
+                        break;
+                    case "FileName":
+                        fileName = parts[1];
+                        break;
+                    case "FileSize":
+                        fileSize = Integer.parseInt(parts[1]);
+                        break;
+                    case "PieceSize":
+                        pieceSize = Integer.parseInt(parts[1]);
+                        break;
+                }
+            }
+
+            numPieces = (int) Math.ceil((double) fileSize / pieceSize);
+            log("Common.cfg parsed successfully.");
+
+        } catch (IOException e) {
+            System.err.println("Error reading Common.cfg");
+            e.printStackTrace();
+        }
+    }
+
+    private void parsePeerInfo() {
         try (BufferedReader br = new BufferedReader(new FileReader("PeerInfo.cfg"))) {
             String line;
             while ((line = br.readLine()) != null) {
-                line = line.trim(); // Remove extra spaces
-
-                // Skip empty lines
+                line = line.trim();
                 if (line.isEmpty())
                     continue;
 
@@ -58,7 +109,8 @@ public class peerProcess {
                 if (id == peerID) {
                     this.hostName = host;
                     this.listeningPort = port;
-                    initializeBitfield(hasFile);
+                    this.hasFile = hasFile;
+                    initializeBitfield();
                 }
             }
         } catch (IOException e) {
@@ -70,8 +122,7 @@ public class peerProcess {
         }
     }
 
-    private void initializeBitfield(boolean hasFile) {
-        int numPieces = 8; // Example, replace with actual calculation from `Common.cfg`
+    private void initializeBitfield() {
         bitfield = new byte[(numPieces + 7) / 8];
 
         if (hasFile) {
@@ -207,7 +258,7 @@ public class peerProcess {
                 // Perform Handshake
                 sendHandshake();
                 if (receiveHandshake()) {
-                    log("Handshake successful");
+                    log("Handshake successful with Peer " + connectedPeerID);
                     sendBitfield();
                 } else {
                     log("Handshake failed");
@@ -282,7 +333,7 @@ public class peerProcess {
             if (type == 5) { // Bitfield message type
                 byte[] receivedBitfield = new byte[length - 1];
                 in.readFully(receivedBitfield);
-                log("Received Bitfield from Peer.");
+                log("Received Bitfield from Peer " + connectedPeerID);
             }
         }
 
