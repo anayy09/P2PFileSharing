@@ -6,9 +6,10 @@ public class peerProcess {
     private int peerID;
     private String hostName;
     private int listeningPort;
-    // private boolean hasFile; // Commented out for now
+    private boolean hasFile; // Commented out for now
     private List<PeerInfo> peerList = new ArrayList<>();
     private Map<Integer, Socket> peerConnections = new HashMap<>(); // Stores active peer connections
+    private byte[] bitfield; // Bitfield added
 
     public peerProcess(int peerID) {
         this.peerID = peerID;
@@ -49,15 +50,15 @@ public class peerProcess {
                 int id = Integer.parseInt(parts[0]);
                 String host = parts[1];
                 int port = Integer.parseInt(parts[2]);
-                // boolean hasFile = parts[3].equals("1"); // Commented out for now
+                boolean hasFile = parts[3].equals("1"); // Commented out for now
 
-                peerList.add(new PeerInfo(id, host, port));
+                peerList.add(new PeerInfo(id, host, port, hasFile));
 
                 // Store details for this peer
                 if (id == peerID) {
                     this.hostName = host;
                     this.listeningPort = port;
-                    // this.hasFile = hasFile; // Commented out for now
+                    initializeBitfield(hasFile);
                 }
             }
         } catch (IOException e) {
@@ -66,6 +67,15 @@ public class peerProcess {
         } catch (NumberFormatException e) {
             System.err.println("Error: Invalid number format in PeerInfo.cfg");
             e.printStackTrace();
+        }
+    }
+
+    private void initializeBitfield(boolean hasFile) {
+        int numPieces = 8; // Example, replace with actual calculation from `Common.cfg`
+        bitfield = new byte[(numPieces + 7) / 8];
+
+        if (hasFile) {
+            Arrays.fill(bitfield, (byte) 0xFF); // Mark all pieces as available
         }
     }
 
@@ -87,9 +97,25 @@ public class peerProcess {
             while (true) {
                 Socket socket = serverSocket.accept();
                 log("Connection received from " + socket.getInetAddress());
-
-                new PeerHandler(socket, -1).start(); // No sender ID, as it's an incoming connection
+                new PeerHandler(socket, -1).start();
             }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void log(String message) {
+        String logMessage = "[" + new Date() + "] " + message;
+        System.out.println(logMessage);
+
+        // Create log directory if it doesn't exist
+        File logDir = new File("log");
+        if (!logDir.exists()) {
+            logDir.mkdir();
+        }
+
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter("log/log_peer_" + peerID + ".log", true))) {
+            writer.write(logMessage + "\n");
         } catch (IOException e) {
             e.printStackTrace();
         }
@@ -182,14 +208,24 @@ public class peerProcess {
                 sendHandshake();
                 if (receiveHandshake()) {
                     log("Handshake successful");
+                    sendBitfield();
                 } else {
                     log("Handshake failed");
                 }
 
                 // Message reception loop
                 while (true) {
-                    String receivedMessage = in.readUTF();
-                    log("Received: " + receivedMessage);
+                    try {
+                        // Try to receive regular messages first
+                        String message = in.readUTF();
+                        log("Received: " + message);
+                        continue;
+                    } catch (UTFDataFormatException e) {
+                        // Not a UTF message, might be a bitfield or other protocol message
+                    }
+
+                    // Handle protocol messages like bitfield
+                    receiveBitfield();
                 }
             } catch (IOException e) {
                 log("Connection closed with Peer " + connectedPeerID);
@@ -198,11 +234,9 @@ public class peerProcess {
 
         private void sendHandshake() throws IOException {
             byte[] handshake = new byte[32];
-
             System.arraycopy("P2PFILESHARINGPROJ".getBytes(), 0, handshake, 0, 18);
             byte[] peerIDBytes = intToByteArray(peerID);
             System.arraycopy(peerIDBytes, 0, handshake, 28, 4);
-
             out.write(handshake);
             out.flush();
             log("Sent handshake to peer.");
@@ -211,49 +245,92 @@ public class peerProcess {
         private boolean receiveHandshake() throws IOException {
             byte[] handshake = new byte[32];
             in.readFully(handshake);
-
             String header = new String(handshake, 0, 18);
-            int receivedPeerID = byteArrayToInt(handshake, 28);
 
+            // Extract the peer ID from the handshake
+            int remotePeerID = byteArrayToInt(handshake, 28);
+
+            // Update connectedPeerID if it was unknown (-1)
+            if (connectedPeerID == -1) {
+                connectedPeerID = remotePeerID;
+                // Register this connection in the main peer's connection map
+                peerProcess.this.peerConnections.put(remotePeerID, socket);
+            }
             return header.equals("P2PFILESHARINGPROJ");
         }
-    }
 
-    private void log(String message) {
-        String logMessage = "[" + new Date() + "] " + message;
-        System.out.println(logMessage);
-        try (BufferedWriter writer = new BufferedWriter(new FileWriter("log_peer_" + peerID + ".log", true))) {
-            writer.write(logMessage + "\n");
-        } catch (IOException e) {
-            e.printStackTrace();
+        private void sendBitfield() throws IOException {
+            if (bitfield == null || bitfield.length == 0)
+                return;
+
+            ByteArrayOutputStream byteStream = new ByteArrayOutputStream();
+            DataOutputStream dataOut = new DataOutputStream(byteStream);
+
+            dataOut.writeInt(bitfield.length + 1);
+            dataOut.writeByte(5); // Bitfield message type
+            dataOut.write(bitfield);
+
+            out.write(byteStream.toByteArray());
+            out.flush();
+            log("Sent Bitfield message.");
+        }
+
+        private void receiveBitfield() throws IOException {
+            int length = in.readInt();
+            byte type = in.readByte();
+
+            if (type == 5) { // Bitfield message type
+                byte[] receivedBitfield = new byte[length - 1];
+                in.readFully(receivedBitfield);
+                log("Received Bitfield from Peer.");
+            }
+        }
+
+        private void log(String message) {
+            String logMessage = "[" + new Date() + "] " + message;
+            System.out.println(logMessage);
+
+            // Create log directory if it doesn't exist
+            File logDir = new File("log");
+            if (!logDir.exists()) {
+                logDir.mkdir();
+            }
+
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter("log/log_peer_" + peerID + ".log", true))) {
+                writer.write(logMessage + "\n");
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+        private byte[] intToByteArray(int value) {
+            return new byte[] {
+                    (byte) (value >> 24),
+                    (byte) (value >> 16),
+                    (byte) (value >> 8),
+                    (byte) value
+            };
+        }
+
+        private int byteArrayToInt(byte[] bytes, int startIndex) {
+            return ((bytes[startIndex] & 0xFF) << 24) |
+                    ((bytes[startIndex + 1] & 0xFF) << 16) |
+                    ((bytes[startIndex + 2] & 0xFF) << 8) |
+                    (bytes[startIndex + 3] & 0xFF);
         }
     }
 
-    private byte[] intToByteArray(int value) {
-        return new byte[] {
-                (byte) (value >> 24),
-                (byte) (value >> 16),
-                (byte) (value >> 8),
-                (byte) value
-        };
-    }
+    class PeerInfo {
+        int id;
+        String hostName;
+        int port;
+        boolean hasFile;
 
-    private int byteArrayToInt(byte[] bytes, int startIndex) {
-        return ((bytes[startIndex] & 0xFF) << 24) |
-                ((bytes[startIndex + 1] & 0xFF) << 16) |
-                ((bytes[startIndex + 2] & 0xFF) << 8) |
-                (bytes[startIndex + 3] & 0xFF);
-    }
-}
-
-class PeerInfo {
-    int id;
-    String hostName;
-    int port;
-
-    public PeerInfo(int id, String hostName, int port) {
-        this.id = id;
-        this.hostName = hostName;
-        this.port = port;
+        public PeerInfo(int id, String hostName, int port, boolean hasFile) {
+            this.id = id;
+            this.hostName = hostName;
+            this.port = port;
+            this.hasFile = hasFile;
+        }
     }
 }
