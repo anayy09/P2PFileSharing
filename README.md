@@ -92,47 +92,21 @@ Example logs:
 [Time]: Peer 1002 has downloaded the piece [4] from Peer 1001.
 ```
 
-### **📝 How to Send a Message**
+## **📩 Message Exchange Between Peers**
 
-In any peer's terminal, type a message in the following format:
-
-1. ```
-   <peerID>: <message>
-   ```
-
-   **Example:**
-
-   ```
-   1002: Hello, Peer 1002!
-   ```
-
-   * This sends the message `"Hello, Peer 1002!"` from the current peer  **to Peer 1002** .
-   * The receiving peer (`1002`) will **log and display** the received message.
-
----
-
-### **📌 Example Message Exchange**
-
-#### **Console Output for Peer 1001**
+Peers can exchange messages using the following format in the terminal:
 
 ```
-> 1002: Hello, Peer 1002!
-[Time]: Sent message to Peer 1002: Hello, Peer 1002!
+<peerID>: <message>
 ```
 
-#### **Console Output for Peer 1002**
+**Example:**
 
 ```
-[Time]: Received message from Peer 1001: Hello, Peer 1002!
+1002: Hello, Peer 1002!
 ```
 
----
-
-### **⚙️ How It Works Internally**
-
-* The sender **formats the message** and sends it as a  **Type 9 protocol message** .
-* The receiver  **reads the message** , logs it, and prints it to the console.
-* Messages are  **not broadcasted** ; they are sent  **peer-to-peer** .
+This sends the message **"Hello, Peer 1002!"** from the current peer to  **Peer 1002** . The recipient will log and display the received message.
 
 ## ❗ Known Issues (Midpoint)
 
