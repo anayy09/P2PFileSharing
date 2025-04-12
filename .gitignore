@@ -10,8 +10,8 @@
 Thumbs.db
 
 # Ignore configuration files (avoid accidental sharing of test data)
-Common.cfg
-PeerInfo.cfg
+# Common.cfg
+# PeerInfo.cfg
 
 # Ignore logs
 *.log
@@ -24,4 +24,5 @@ PeerInfo.cfg
 1005/
 1006/
 
-P2PFileSharing.txt
+*.pdf
+*.zip
