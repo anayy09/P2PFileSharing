@@ -1,8 +1,8 @@
 # P2P File Sharing System
 
-This project is a  **Peer-to-Peer (P2P) file-sharing system** , inspired by  **BitTorrent** , implemented in  **Java** . It is part of the  CNT5106C **Computer Networks (Spring 2025)**.
+This project is a **Peer-to-Peer (P2P) file-sharing system**, inspired by **BitTorrent**, implemented in **Java**. It is part of the CNT5106C **Computer Networks (Spring 2025)**.
 
-## 🚀 Features (Midpoint Submission)
+## 🚀 Features (Final Submission)
 
 ✔ Establishes P2P connections using **TCP sockets**
 
@@ -22,14 +22,22 @@ This project is a  **Peer-to-Peer (P2P) file-sharing system** , inspired by  **B
 
 ✔ Initializes a **file system** for each peer (storing received pieces)
 
+✔ Implements **file sharing** with piece request and response logic
+
+✔ Implements **choking/unchoking logic** to prioritize download sources
+
+✔ Reassembles the complete file once all pieces are received
+
+✔ Handles **termination condition** when all peers have the complete file
+
 ## 🛠️ Getting Started
 
 ### **1️⃣ Setup Environment**
 
-1. Install  **JDK 17 or higher** .
+1. Install **JDK 17 or higher**.
 2. Clone the repository:
    ```sh
-   git clone https://github.com/<username>/P2PFileSharing.git
+   git clone https://github.com/anayy09/P2PFileSharing.git
    cd P2PFileSharing
    ```
 3. Ensure the **configuration files** (`Common.cfg`, `PeerInfo.cfg`) are in the project root.
@@ -44,7 +52,7 @@ javac peerProcess.java
 
 #### **Run a Peer**
 
-Each peer is started separately by providing a unique  **peer ID** :
+Each peer is started separately by providing a unique **peer ID**:
 
 ```sh
 java peerProcess 1001
@@ -84,34 +92,21 @@ The system logs:
 
 ✔ File transfer status
 
+✔ Choking/unchoking events
+
+✔ Termination condition when all peers have the complete file
+
 Example logs:
 
 ```
 [Time]: Peer 1001 received the ‘interested’ message from Peer 1002.
 [Time]: Peer 1001 sent the ‘not interested’ message to Peer 1003.
 [Time]: Peer 1002 has downloaded the piece [4] from Peer 1001.
+[Time]: Peer 1001 has downloaded the complete file.
 ```
 
-## **📩 Message Exchange Between Peers**
+## ❗ Known Issues (Final Submission)
 
-Peers can exchange messages using the following format in the terminal:
+🔹 **Rare Piece Selection Not Implemented** – The rarest-first strategy for piece selection is not yet implemented.
 
-```
-<peerID>: <message>
-```
-
-**Example:**
-
-```
-1002: Hello, Peer 1002!
-```
-
-This sends the message **"Hello, Peer 1002!"** from the current peer to  **Peer 1002** . The recipient will log and display the received message.
-
-## ❗ Known Issues (Midpoint)
-
-🔹 **File Sharing Not Implemented Yet** – The actual piece download/upload mechanism is still in development.
-
-🔹 **No Choking/Unchoking Logic** – Peers do not yet prioritize download sources.
-
-🔹 **No Piece Request/Response** – The protocol to request and send pieces is not completed yet.
+🔹 **No Dynamic Reconnection** – Peers do not retry connections dynamically if a peer becomes available later.
