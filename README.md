@@ -76,7 +76,7 @@ P2PFileSharing/
 │── PeerInfo.cfg  # Peer information (IDs, ports, initial file ownership)
 │── peerProcess.java  # Main peer-to-peer file-sharing logic
 │── log/          # Logs for each peer's network activity
-│── peer_1001/    # Directory for Peer 1001 (stores received pieces)
+│── peer_1001/    # Directory for Peer 1001
 │── peer_1002/    # Directory for Peer 1002
 │── peer_1003/
 ```
@@ -104,9 +104,3 @@ Example logs:
 [Time]: Peer 1002 has downloaded the piece [4] from Peer 1001.
 [Time]: Peer 1001 has downloaded the complete file.
 ```
-
-## ❗ Known Issues (Final Submission)
-
-🔹 **Rare Piece Selection Not Implemented** – The rarest-first strategy for piece selection is not yet implemented.
-
-🔹 **No Dynamic Reconnection** – Peers do not retry connections dynamically if a peer becomes available later.

@@ -61,7 +61,6 @@ public class peerProcess {
     private static final byte MSG_BITFIELD = 5;
     private static final byte MSG_REQUEST = 6;
     private static final byte MSG_PIECE = 7;
-    private static final byte MSG_HANDSHAKE = -1;
 
     // --- PeerInfo Class ---
     private static class PeerInfo {
@@ -393,62 +392,6 @@ public class peerProcess {
             buffer.put(payload);
             return buffer.array();
         }
-
-        static ActualMessage fromBytes(byte[] data) {
-            if (data == null || data.length < 5) { // 4 for length, 1 for type
-                // Handle error: Invalid data length
-                System.err.println("Error: Received invalid message data (too short)");
-                return null; // Or throw exception
-            }
-            ByteBuffer buffer = ByteBuffer.wrap(data);
-            int length = buffer.getInt();
-            if (length < 1 || length > data.length - 4) { // Length must include type byte, cannot exceed remaining data
-                System.err.println("Error: Received message with invalid length field: " + length + ", data length: "
-                        + data.length);
-                return null;
-            }
-            byte type = buffer.get();
-            byte[] payload = new byte[length - 1];
-            if (payload.length > 0) {
-                if (buffer.remaining() < payload.length) {
-                    System.err.println("Error: Buffer underflow. Remaining: " + buffer.remaining()
-                            + ", Payload expected: " + payload.length);
-                    return null;
-                }
-                buffer.get(payload);
-            }
-            return new ActualMessage(type, payload);
-        }
-
-        static ActualMessage fromStream(InputStream in) throws IOException {
-            byte[] lengthBytes = new byte[4];
-            int bytesRead = in.read(lengthBytes);
-            if (bytesRead < 4) {
-                // End of stream or incomplete read
-                return null;
-            }
-            ByteBuffer lengthBuffer = ByteBuffer.wrap(lengthBytes);
-            int length = lengthBuffer.getInt();
-
-            if (length < 1) { // Message length must be at least 1 (for the type byte)
-                throw new IOException("Invalid message length received: " + length);
-            }
-
-            byte[] messageData = new byte[length]; // Read type + payload
-            int totalPayloadRead = 0;
-            while (totalPayloadRead < length) {
-                int payloadRead = in.read(messageData, totalPayloadRead, length - totalPayloadRead);
-                if (payloadRead == -1) {
-                    throw new IOException("End of stream while reading message payload");
-                }
-                totalPayloadRead += payloadRead;
-            }
-
-            byte type = messageData[0];
-            byte[] payload = (length > 1) ? Arrays.copyOfRange(messageData, 1, length) : new byte[0];
-
-            return new ActualMessage(type, payload);
-        }
     }
 
     // --- Handshake Message ---
@@ -508,7 +451,6 @@ public class peerProcess {
     private synchronized void updatePeerBitfield(int remotePeerID, byte[] payload) {
         PeerInfo info = peerInfoMap.get(remotePeerID);
         if (info != null) {
-            BitSet receivedBitfield = BitSet.valueOf(payload);
 
             info.bitfield.clear(); // Clear existing bits first
             for (int i = 0; i < numberOfPieces; i++) {
