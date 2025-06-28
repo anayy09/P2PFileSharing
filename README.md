@@ -131,26 +131,125 @@ SparseAckInterval 5000           # ACK interval in milliseconds
 1006 localhost 6006 0 0 50    # No file, regular peer
 ```
 
-## 📝 Logging Events
+## 📊 Message Protocol
 
-The system logs:
-✔ TCP connections (`connected`, `disconnected`)
+The system implements a sophisticated message protocol with the following types:
 
-✔ Bitfield exchange (`sent`, `received`)
+### **BitTorrent Messages**
 
-✔ **Interested / Not Interested messages**
+- **Handshake** (32 bytes): Peer authentication and ID exchange
+- **Bitfield**: Communicates available file pieces  
+- **Interested/Not Interested**: Express download interest
+- **Choke/Unchoke**: Flow control mechanism
+- **Have**: Announce newly acquired pieces
+- **Request**: Request specific pieces  
+- **Piece**: Send requested piece data
 
-✔ File transfer status
+### **Disaster Mode Messages**
 
-✔ Choking/unchoking events
+- **MSG_BCAST_CHUNK**: Fountain-encoded broadcast chunks
+- **MSG_SPARSE_ACK**: Bitmap acknowledgment of received chunks
+- **MSG_ROLE_ELECT**: Super-peer election beacons
 
-✔ Termination condition when all peers have the complete file
+## 📈 Algorithms Implemented
 
-Example logs:
+### **Choking Algorithm**
 
+- **Preferred Neighbors**: Select top downloaders based on rate
+- **Optimistic Unchoking**: Periodically try new peers
+- **Rate Calculation**: Pieces downloaded per time interval
+- **Random Selection**: For seeders (peers with complete file)
+
+### **Piece Selection**
+
+- **Random Strategy**: Prevents bottlenecks and hotspots
+- **Availability Tracking**: Only request available pieces
+- **Interest Management**: Dynamic interested/not-interested states
+
+### **Disaster Mode Algorithm**
+
+- **Super-Peer Election**: Battery level + peer ID tiebreaker
+- **Fountain Coding**: Redundant encoding for lossy networks  
+- **Sparse Acknowledgment**: Efficient bitmap-based progress tracking
+- **Automatic Failback**: Seamless transition to BitTorrent mode
+
+## 🎯 Performance Features
+
+- **Multi-threaded Architecture**: Concurrent connection handling
+- **Connection Pooling**: Efficient resource management
+- **Rate-based Optimization**: Intelligent peer selection
+- **Bandwidth Prioritization**: Preferred neighbor algorithms
+- **Memory Efficient**: BitSet for piece tracking
+- **Scalable Design**: Supports multiple concurrent peers
+
+## 🧪 Testing Scenarios
+
+### **Scenario 1: Basic BitTorrent**
+```bash
+# Terminal 1: Seeder (has complete file)
+java peerProcess 1001
+
+# Terminal 2-3: Leechers  
+java peerProcess 1002
+java peerProcess 1003
 ```
-[Time]: Peer 1001 received the ‘interested’ message from Peer 1002.
-[Time]: Peer 1001 sent the ‘not interested’ message to Peer 1003.
-[Time]: Peer 1002 has downloaded the piece [4] from Peer 1001.
-[Time]: Peer 1001 has downloaded the complete file.
+
+### **Scenario 2: Disaster Mode**
+```bash
+# Enable disaster mode for all peers
+java peerProcess 1001 --disaster
+java peerProcess 1002 --disaster  
+java peerProcess 1005 --disaster
 ```
+
+### **Scenario 3: Mixed Mode**
+```bash
+# Test failback mechanism
+java peerProcess 1001 --disaster --wan-return
+java peerProcess 1002 --disaster
+```
+
+## 🔧 Troubleshooting
+
+### **Common Issues**
+
+- **Port Already in Use**: Check if another peer is running on the same port
+- **File Not Found**: Ensure initial file exists in `peer_XXXX/` directory
+- **Connection Timeout**: Verify network connectivity and firewall settings
+- **Config Parse Error**: Check format of `Common.cfg` and `PeerInfo.cfg`
+
+### **Debug Options**
+
+- Check log files in `log_peer_XXXX/` directories
+- Monitor network connections with `netstat -an | grep :600X`
+- Verify file integrity after transfer completion
+
+## 🏗️ Architecture Highlights
+
+### **Core Classes**
+
+- **`peerProcess`**: Main peer implementation
+- **`PeerConnectionHandler`**: Individual connection management  
+- **`ActualMessage`**: Protocol message structure
+- **`PeerInfo`**: Peer metadata and state
+- **`FountainCoder`**: Disaster mode encoding/decoding
+
+### **Design Patterns**
+
+- **Observer Pattern**: Interest state management
+- **Strategy Pattern**: Piece selection algorithms
+- **Factory Pattern**: Message creation
+- **State Pattern**: Connection lifecycle management
+
+## 📜 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 👨‍💻 Author
+
+**Anay Sinhal** - [anayy09](https://github.com/anayy09)
+**Radhey Sharma** - [radheysharma13](https://github.com/radheysharma13)
+
+---
+
+*Built for CNT5106C Computer Networks (Spring 2025) - University of Florida*
