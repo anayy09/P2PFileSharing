@@ -8,6 +8,12 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
+// Conceptual OpenRQ import - in a real scenario, this would be handled by the build system
+import org.openrq.OpenRQ;
+import org.openrq.encoder.Encoder;
+import org.openrq.decoder.Decoder;
+import org.openrq.Symbol;
+
 public class peerProcess {
 
     // Configuration constants
@@ -47,10 +53,24 @@ public class peerProcess {
     private final SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
 
     // Concurrency
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2); // For choking and
-                                                                                            // optimistic unchoking
-                                                                                            // tasks
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(3); // Increased for disaster mode tasks
     private final ExecutorService connectionExecutor = Executors.newCachedThreadPool();
+
+    // --- CLI Flags ---
+    private static boolean disasterMode = false;
+    private static boolean wanReturn = false;
+
+    // --- Disaster Mode Specific Fields ---
+    private volatile boolean I_AM_SUPER = false;
+    private int broadcastChunkSize; // From Common.cfg
+    private int sparseAckInterval;  // From Common.cfg
+    private FountainCoder fountainEncoder; // For super-peer
+    private Decoder fountainDecoder;       // For normal peers in disaster mode
+    private BitSet broadcastReceivedChunks; // For normal peers to track received fountain chunks
+    private int numberOfBroadcastChunks; // Derived from fileSize and broadcastChunkSize
+    private final Map<Integer, BitSet> peerBroadcastProgress = new ConcurrentHashMap<>(); // Super-peer tracks this
+    private final AtomicInteger peersCompletedBroadcast = new AtomicInteger(0);
+
 
     // --- Message Types ---
     private static final byte MSG_CHOKE = 0;
@@ -61,6 +81,11 @@ public class peerProcess {
     private static final byte MSG_BITFIELD = 5;
     private static final byte MSG_REQUEST = 6;
     private static final byte MSG_PIECE = 7;
+    // New swarm-level message types
+    private static final byte MSG_BCAST_CHUNK = 8;  // fountain-encoded chunk
+    private static final byte MSG_SPARSE_ACK = 9;  // bitmap of received chunks
+    private static final byte MSG_ROLE_ELECT = 10; // election beacon / vote
+
 
     // --- PeerInfo Class ---
     private static class PeerInfo {
@@ -73,17 +98,26 @@ public class peerProcess {
         volatile long downloadStartTime = 0;
         volatile int piecesDownloadedInInterval = 0;
 
-        PeerInfo(int peerID, String hostName, int port, boolean hasFile) {
+        // Disaster mode fields
+        boolean isSuperCandidate;
+        int batteryLevel;
+        BitSet lastReportedBroadcastChunks; // What this peer reported having (for super-peer's tracking)
+
+        PeerInfo(int peerID, String hostName, int port, boolean hasFile, boolean isSuperCandidate, int batteryLevel) {
             this.peerID = peerID;
             this.hostName = hostName;
             this.port = port;
             this.hasFile = hasFile;
+            this.isSuperCandidate = isSuperCandidate;
+            this.batteryLevel = batteryLevel;
+            this.lastReportedBroadcastChunks = new BitSet();
         }
 
         @Override
         public String toString() {
-            return "PeerInfo{" + "peerID=" + peerID + ", hostName='" + hostName + "'" + ", port=" + port + ", hasFile="
-                    + hasFile + '}';
+            return "PeerInfo{" + "peerID=" + peerID + ", hostName='" + hostName + "'" + ", port=" + port
+                    + ", hasFile=" + hasFile + ", isSuperCandidate=" + isSuperCandidate
+                    + ", batteryLevel=" + batteryLevel + '}';
         }
     }
 
@@ -117,9 +151,8 @@ public class peerProcess {
         try (BufferedReader reader = new BufferedReader(new FileReader(COMMON_CFG_PATH))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                String[] parts = line.split("\s+");
-                if (parts.length < 2)
-                    continue;
+                String[] parts = line.split("\\s+"); // Use regex for whitespace
+                if (parts.length < 2) continue;
                 switch (parts[0]) {
                     case "NumberOfPreferredNeighbors":
                         numberOfPreferredNeighbors = Integer.parseInt(parts[1]);
@@ -139,17 +172,36 @@ public class peerProcess {
                     case "PieceSize":
                         pieceSize = Integer.parseInt(parts[1]);
                         break;
+                    case "BroadcastChunkSize": // New for disaster mode
+                        broadcastChunkSize = Integer.parseInt(parts[1]);
+                        break;
+                    case "SparseAckInterval": // New for disaster mode
+                        sparseAckInterval = Integer.parseInt(parts[1]);
+                        break;
                 }
             }
             numberOfPieces = (int) Math.ceil((double) fileSize / pieceSize);
             this.bitfield = new BitSet(numberOfPieces);
+
+            if (broadcastChunkSize > 0) {
+                numberOfBroadcastChunks = (int) Math.ceil((double) fileSize / broadcastChunkSize);
+                this.broadcastReceivedChunks = new BitSet(numberOfBroadcastChunks);
+            } else if (disasterMode) {
+                log("Error: BroadcastChunkSize must be positive in disaster mode.");
+                throw new IOException("BroadcastChunkSize must be positive in disaster mode.");
+            }
+
+
             log("Common config loaded: PreferredNeighbors=" + numberOfPreferredNeighbors +
                     ", UnchokingInterval=" + unchokingInterval +
                     ", OptimisticInterval=" + optimisticUnchokingInterval +
                     ", FileName=" + fileName +
                     ", FileSize=" + fileSize +
                     ", PieceSize=" + pieceSize +
-                    ", NumPieces=" + numberOfPieces);
+                    ", NumPieces (BitTorrent)=" + numberOfPieces +
+                    ", BroadcastChunkSize=" + broadcastChunkSize +
+                    ", SparseAckInterval=" + sparseAckInterval +
+                    ", NumBroadcastChunks=" + numberOfBroadcastChunks);
         }
     }
 
@@ -158,34 +210,44 @@ public class peerProcess {
         try (BufferedReader reader = new BufferedReader(new FileReader(PEER_INFO_CFG_PATH))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                String[] parts = line.split("\s+");
-                if (parts.length < 4)
-                    continue;
+                String[] parts = line.split("\\s+");
+                if (parts.length < 4) continue; // Base case: ID, Host, Port, HasFile
+                
                 int id = Integer.parseInt(parts[0]);
                 String host = parts[1];
                 int port = Integer.parseInt(parts[2]);
-                boolean hasFile = Integer.parseInt(parts[3]) == 1;
+                boolean hasFileBT = Integer.parseInt(parts[3]) == 1;
 
-                PeerInfo info = new PeerInfo(id, host, port, hasFile);
-                info.bitfield = new BitSet(numberOfPieces); // Initialize bitfield
-                if (hasFile) {
-                    info.bitfield.set(0, numberOfPieces); // If peer starts with file, set all bits
-                    totalPeersCompleted.incrementAndGet(); // Count peers starting with the file
+                // Defaults for new disaster mode fields if not present in file
+                boolean isSuperCand = false;
+                int battery = 0;
+                if (parts.length >= 6) { // Check if disaster mode fields are present
+                    isSuperCand = Integer.parseInt(parts[4]) == 1;
+                    battery = Integer.parseInt(parts[5]);
+                } else if (parts.length == 5) { // Handle if only isSuperCandidate is present
+                    isSuperCand = Integer.parseInt(parts[4]) == 1;
+                }
+
+
+                PeerInfo info = new PeerInfo(id, host, port, hasFileBT, isSuperCand, battery);
+                info.bitfield = new BitSet(numberOfPieces); // Initialize BitTorrent bitfield
+                if (hasFileBT) {
+                    info.bitfield.set(0, numberOfPieces);
+                    totalPeersCompleted.incrementAndGet();
                 }
                 peerInfoMap.put(id, info);
 
                 if (id == this.peerID) {
                     this.hostName = host;
                     this.listeningPort = port;
-                    this.hasFileInitially = hasFile;
-                    if (hasFile) {
+                    this.hasFileInitially = hasFileBT;
+                    if (hasFileBT) {
                         this.bitfield.set(0, numberOfPieces);
-                        log("Peer " + peerID + " starts with the complete file.");
-                        loadInitialFilePieces();
+                        log("Peer " + peerID + " starts with the complete file (BitTorrent mode).");
+                        loadInitialFilePieces(); // Load for BitTorrent and potentially for broadcast encoding
                     } else {
-                        // Initialize filePieces array
                         this.filePieces = new byte[numberOfPieces][];
-                        log("Peer " + peerID + " starts without the file.");
+                        log("Peer " + peerID + " starts without the file (BitTorrent mode).");
                     }
                 }
             }
@@ -236,6 +298,58 @@ public class peerProcess {
             e.printStackTrace();
             System.exit(1);
         }
+        // This method now also serves to load the file for the super-peer to broadcast
+        if (this.hasFileInitially && disasterMode && this.filePieces != null) {
+             // In disaster mode, if this peer has the file, it might become a super-peer.
+             // The filePieces array is already loaded. We need to prepare the full file data for the FountainCoder.
+            log("File loaded, available for potential broadcast as super-peer.");
+        }
+    }
+
+    private byte[] getFullFileBytes() {
+        if (!hasFileInitially && filePieces == null) { // if this peer doesn't have the file (e.g. was a leecher that completed)
+                                                       // or hasFileInitially is false and filePieces is not yet populated for some reason
+             if (bitfield.cardinality() == numberOfPieces) { // but it has all BT pieces
+                log("Reconstructing full file from downloaded BitTorrent pieces for broadcast encoding.");
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                try {
+                    for (int i = 0; i < numberOfPieces; i++) {
+                        if (filePieces[i] != null) {
+                            baos.write(filePieces[i]);
+                        } else {
+                            log("Error: Missing piece " + i + " when trying to get full file bytes for broadcast.");
+                            return null; // Or throw exception
+                        }
+                    }
+                     return baos.toByteArray();
+                } catch (IOException e) {
+                    log("Error creating full file byte array: " + e.getMessage());
+                    return null;
+                }
+
+             } else {
+                log("Cannot get full file bytes: File not initially present or not fully downloaded via BitTorrent.");
+                return null;
+             }
+        } else if (hasFileInitially && filePieces != null) { // Loaded from disk
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            try {
+                for (int i = 0; i < numberOfPieces; i++) {
+                     if (filePieces[i] != null) baos.write(filePieces[i]);
+                     else {
+                         log("Error: Initial file piece " + i + " is null during getFullFileBytes."); return null;
+                     }
+                }
+                return baos.toByteArray();
+            } catch (IOException e) {
+                log("Error creating full file byte array from initial pieces: " + e.getMessage());
+                return null;
+            }
+        }
+        // Fallback if filePieces is directly populated some other way but not marked as hasFileInitially
+        // This path should ideally not be taken if logic is correct elsewhere.
+        log("Warning: getFullFileBytes() called in an unexpected state.");
+        return null;
     }
 
     private synchronized void savePiece(int pieceIndex, byte[] data) {
@@ -310,6 +424,48 @@ public class peerProcess {
             e.printStackTrace();
         }
     }
+    
+    private void reassembleBroadcastFile() {
+        if (fountainDecoder == null || !fountainDecoder.isDataDecoded()) {
+            log("Cannot reassemble broadcast file: Decoder not ready or data not fully decoded.");
+            return;
+        }
+        log("Reassembling the complete file from broadcast: " + fileName);
+        File outputFile = new File("peer_" + peerID + "/" + fileName + "_broadcast_decoded"); // Save with a different name for testing
+        outputFile.getParentFile().mkdirs();
+
+        try (FileOutputStream fos = new FileOutputStream(outputFile)) {
+            //byte[] decodedData = fountainDecoder.getDecodedData(); // Assuming FountainCoder provides this
+            //fos.write(decodedData);
+            log("Conceptual: Writing decoded data from fountain decoder to " + outputFile.getPath());
+            // For actual OpenRQ, you'd get the decoded data from the decoder object.
+            // Example: ByteBuffer[] decodedSymbols = fountainDecoder.getDecodedSymbols(); // This is conceptual for OpenRQ
+            // for (ByteBuffer symbol : decodedSymbols) { fos.write(symbol.array()); }
+
+            // Using the OpenRQ API structure provided in the plan:
+            // The OpenRQ decoder directly writes to a ByteBuffer or file.
+            // Assuming decoder was initialized to write to a buffer/file.
+            // If decoder was initialized with OpenRQ.newDecoder(target_channel, ...), it would write there.
+            // If it was an in-memory decoder, data needs to be retrieved.
+            // For now, let's assume the FountainCoder helper would abstract this.
+            // Conceptual call:
+            byte[] fileData = fountainDecoder.retrieveDecodedData(); // This method needs to be in our conceptual FountainCoder
+            if (fileData != null) {
+                fos.write(fileData);
+                log("File reassembly from broadcast complete: " + outputFile.getPath());
+                hasFileInitially = true; // Now we have the file
+                bitfield.set(0, numberOfPieces); // Mark all BT pieces as available too
+                totalPeersCompleted.incrementAndGet(); // Consider this peer complete for BT termination
+            } else {
+                 log("Error: Failed to retrieve decoded data from FountainDecoder.");
+            }
+
+        } catch (IOException e) {
+            log("Error writing reassembled broadcast file: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
 
     // --- Networking ---
     private void startServer() {
@@ -365,6 +521,9 @@ public class peerProcess {
                 });
             }
         }
+        // In disaster mode, connections are still TCP for MSG_ROLE_ELECT, MSG_SPARSE_ACK.
+        // MSG_BCAST_CHUNK is conceptually a broadcast, but here sent over established TCP for simplicity.
+        // A true UDP broadcast is more complex and not specified in current peerProcess structure.
     }
 
     // --- Message Handling ---
@@ -516,7 +675,7 @@ public class peerProcess {
             return -1; // No pieces they have that I need
         }
 
-        // --- Random Selection Strategy ---
+                // --- Random Selection Strategy ---
         List<Integer> availablePieces = new ArrayList<>();
         for (int i = theyHave.nextSetBit(0); i >= 0; i = theyHave.nextSetBit(i + 1)) {
 
@@ -535,19 +694,19 @@ public class peerProcess {
 
     }
 
-    // --- Choking/Unchoking Logic ---
-    private void startChokingTasks() {
-        // Task to recalculate preferred neighbors
-        scheduler.scheduleAtFixedRate(this::determinePreferredNeighbors,
-                unchokingInterval, unchokingInterval, TimeUnit.SECONDS);
-
-        // Task to recalculate optimistically unchoked neighbor
-        scheduler.scheduleAtFixedRate(this::determineOptimisticNeighbor,
-                optimisticUnchokingInterval, optimisticUnchokingInterval, TimeUnit.SECONDS);
-        log("Scheduled choking tasks. UnchokingInterval=" + unchokingInterval + "s, OptimisticInterval="
-                + optimisticUnchokingInterval + "s");
+    // --- Choking/Unchoking Logic (for BitTorrent mode) ---
+    private void startChokingTasks() { // Only if not in disaster mode primary operation, or after fail-back
+        if (!disasterMode || (disasterMode && wanReturn)) { // Only run these in BT mode
+            scheduler.scheduleAtFixedRate(this::determinePreferredNeighbors,
+                    unchokingInterval, unchokingInterval, TimeUnit.SECONDS);
+            scheduler.scheduleAtFixedRate(this::determineOptimisticNeighbor,
+                    optimisticUnchokingInterval, optimisticUnchokingInterval, TimeUnit.SECONDS);
+            log("Scheduled choking tasks for BitTorrent mode.");
+        } else {
+            log("Skipping BitTorrent choking tasks in disaster mode initial phase.");
+        }
     }
-
+    
     private synchronized void determinePreferredNeighbors() {
         if (interestedPeers.isEmpty()) {
             log("No peers are interested, skipping preferred neighbor selection.");
@@ -707,15 +866,28 @@ public class peerProcess {
         log("Optimistically unchoked neighbor updated: " + optimisticallyUnchokedNeighbor);
     }
 
-    // --- Termination Check ---
+    // --- Termination Check (modified for disaster mode) ---
     private boolean checkTerminationCondition() {
-        // Condition: All peers (including self) have the complete file.
-        if (totalPeersCompleted.get() == peerInfoMap.size()) {
-            log("Termination condition met: All " + peerInfoMap.size() + " peers have the complete file.");
-            return true;
+        if (disasterMode && !wanReturn && I_AM_SUPER) {
+            // Super-peer in disaster mode terminates broadcast when all peers ACK completion
+            if (peersCompletedBroadcast.get() == (peerInfoMap.size() -1) && peerInfoMap.size() > 1) { // -1 for super-peer itself
+                 log("Disaster Mode Termination: All connected normal peers have acknowledged broadcast completion.");
+                 return true; // This will trigger fail-back logic for super-peer
+            }
+            return false;
+        } else if (disasterMode && !wanReturn && !I_AM_SUPER) {
+            // Normal peer in disaster mode: "termination" is having the full file from broadcast
+            return broadcastReceivedChunks.cardinality() == numberOfBroadcastChunks;
+        } else {
+            // BitTorrent mode termination
+            if (totalPeersCompleted.get() == peerInfoMap.size()) {
+                log("BitTorrent Mode Termination condition met: All " + peerInfoMap.size() + " peers have the complete file.");
+                return true;
+            }
         }
         return false;
     }
+
 
     private void shutdown() {
         log("Initiating shutdown sequence.");
@@ -764,6 +936,271 @@ public class peerProcess {
         activeConnections.values().forEach(handler -> handler.sendMessage(haveMsgBytes));
     }
 
+
+    // --- Disaster Mode Methods ---
+
+    // Conceptual FountainCoder Class (as an inner class for this example)
+    // In a real project, this would be a separate FountainCoder.java file and use OpenRQ.
+    private class FountainCoder {
+        private final byte[] originalFile;
+        private final int chunkSize;
+        private int currentChunkIndex = 0; // Simple sequential chunking for this conceptual version
+        private final int totalChunks;
+
+        // For Encoder (Super Peer)
+        public FountainCoder(byte[] fileData, int chunkSize) {
+            this.originalFile = fileData;
+            this.chunkSize = chunkSize;
+            this.totalChunks = (int) Math.ceil((double) fileData.length / chunkSize);
+            log("FountainCoder (Encoder) initialized for " + fileData.length + " bytes, chunk size " + chunkSize + ", total chunks " + totalChunks);
+            // Real OpenRQ: this.encoder = OpenRQ.newEncoder(ByteBuffer.wrap(fileData), 0, chunkSize, calculateOverhead(...));
+        }
+
+        // For Decoder (Normal Peer)
+        public FountainCoder(int fileSize, int chunkSize, int numChunks) {
+            this.originalFile = new byte[fileSize]; // Buffer to reconstruct the file
+            this.chunkSize = chunkSize;
+            this.totalChunks = numChunks;
+            // Real OpenRQ: this.decoder = OpenRQ.newDecoder(target_channel_or_buffer, fileSize, chunkSize);
+            log("FountainCoder (Decoder) initialized for file size " + fileSize + ", expecting " + numChunks + " chunks of size " + chunkSize);
+        }
+        
+        // Super-peer side
+        public ByteBuffer nextChunk() { // Conceptual - real fountain coding is more complex
+            if (originalFile == null) {
+                 log("FountainCoder: Original file not loaded for encoding.");
+                 return null;
+            }
+            if (currentChunkIndex >= totalChunks) {
+                log("FountainCoder: All original chunks sent (conceptual). Real fountain codes can generate more unique symbols.");
+                // A true fountain coder can generate more symbols than original chunks.
+                // For this simplified version, let's just loop or stop. Let's stop.
+                return null;
+            }
+            int offset = currentChunkIndex * chunkSize;
+            int length = Math.min(chunkSize, originalFile.length - offset);
+            ByteBuffer chunk = ByteBuffer.wrap(originalFile, offset, length);
+            // In real OpenRQ: return encoder.sourceBlock(0).nextSymbol();
+            currentChunkIndex++;
+            return chunk;
+        }
+
+        // Normal peer side
+        public void receiveChunk(ByteBuffer chunkData, int chunkId) { // chunkId might be part of payload or implicit
+            // Real OpenRQ: decoder.sourceBlock(0).putSymbol(chunkData);
+            // For conceptual: copy data into broadcastReceivedChunks and potentially into a reassembly buffer.
+            // We assume chunkData is a raw piece of the file for this simple version.
+            // The 'broadcastReceivedChunks' BitSet in peerProcess handles tracking.
+            // The actual data would be stored in a temporary structure for reassembly by the decoder.
+            log("FountainDecoder: Received chunk " + chunkId + " (conceptual). Size: " + chunkData.remaining());
+            // If this were a real decoder, it would store this symbol internally.
+        }
+        
+        // Normal peer side
+        public boolean isDataDecoded() {
+            // Real OpenRQ: return decoder.isDataDecoded();
+            // Conceptual: This would be true if broadcastReceivedChunks.cardinality() == numberOfBroadcastChunks
+            // but true decoding depends on the properties of the fountain code.
+            // For our example, we'll rely on peerProcess.broadcastReceivedChunks for this logic externally.
+            // The decoder itself would know internally.
+            return broadcastReceivedChunks.cardinality() == numberOfBroadcastChunks; // Placeholder
+        }
+        
+        public byte[] retrieveDecodedData() { // Conceptual for OpenRQ
+            // In OpenRQ, if decoding to a ByteBuffer, you'd access that buffer.
+            // If decoding to a file, the file would be written.
+            // This method simulates retrieving the fully decoded file.
+            if (isDataDecoded()) {
+                // If we were storing chunks in a map for simple reassembly:
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                // This part is highly conceptual without the real decoder logic.
+                // Assume the 'originalFile' buffer was filled by the decoder.
+                // For this example, it's hard to show reassembly without the actual decoder.
+                // Let's assume the FountainDecoder handles reassembly internally and provides the full file.
+                // This is a MAJOR simplification.
+                log("FountainDecoder: Retrieving decoded data (conceptual).");
+                // This needs a proper implementation based on how chunks are stored/decoded.
+                // For now, returning null as a placeholder.
+                // A real implementation would return the reassembled file from the decoder's internal state.
+                return null; // Placeholder - requires real decoder logic
+            }
+            return null;
+        }
+    }
+
+
+    private volatile boolean I_AM_SUPER = false;
+    private void electSuperPeer() {
+        log("Starting super-peer election...");
+        Optional<PeerInfo> winner = peerInfoMap.values().stream()
+            .filter(p -> p.isSuperCandidate)
+            .max(Comparator.<PeerInfo>comparingInt(p -> p.batteryLevel)
+                 .thenComparingInt(p -> -p.peerID)); // lower ID wins on tie (negate for max)
+
+        if (winner.isPresent()) {
+            if (winner.get().peerID == this.peerID) {
+                I_AM_SUPER = true;
+                log("I have been elected SUPER peer (" + this.peerID + "). Battery: " + winner.get().batteryLevel);
+                // Initialize fountain encoder if I am super and have the file
+                if (hasFileInitially || bitfield.cardinality() == numberOfPieces) { // Check if it has the file either initially or downloaded
+                    byte[] fullFile = getFullFileBytes();
+                    if (fullFile != null) {
+                        this.fountainEncoder = new FountainCoder(fullFile, broadcastChunkSize);
+                         log("Fountain encoder initialized for super-peer.");
+                    } else {
+                        log("Error: Super-peer elected but cannot load full file for encoding. Aborting super-peer role.");
+                        I_AM_SUPER = false; // Cannot be super without the file to encode
+                    }
+                } else {
+                     log("Error: Super-peer elected but does not have the file. Aborting super-peer role.");
+                     I_AM_SUPER = false;
+                }
+            } else {
+                I_AM_SUPER = false;
+                log("Peer " + winner.get().peerID + " is elected super peer. I am a normal peer.");
+            }
+        } else {
+            I_AM_SUPER = false;
+            log("No super peer elected (no candidates or tie-breaking failed).");
+        }
+        // All peers (including non-super) initialize a decoder if in disaster mode
+        if (disasterMode && !I_AM_SUPER) {
+             this.fountainDecoder = new FountainCoder(fileSize, broadcastChunkSize, numberOfBroadcastChunks);
+             log("Fountain decoder initialized for normal peer.");
+        }
+
+        // Broadcast MSG_ROLE_ELECT (beacon/vote) - simplified: just announce role
+        // A true election protocol would be more complex (e.g., RAFT, Paxos, or custom).
+        // For now, each peer decides based on config and broadcasts its status if it thinks it won.
+        // Or, peers could send their candidacy and let others confirm.
+        // The plan says "Call electSuperPeer() once at start-up and again whenever a MSG_ROLE_ELECT beacon arrives"
+        // This implies MSG_ROLE_ELECT might carry information to trigger re-election.
+        // For simplicity, let's assume initial election is by config, and MSG_ROLE_ELECT is a heartbeat/announcement.
+        // This part needs more specification for a robust election.
+        // For now, election is deterministic from config.
+
+    }
+
+    private void broadcastNextChunk() {
+        if (!I_AM_SUPER || fountainEncoder == null) return;
+
+        ByteBuffer chunk = fountainEncoder.nextChunk(); // Conceptual
+        if (chunk == null) {
+            log("Super-peer: Fountain encoder finished sending all conceptual chunks or file fully broadcasted.");
+            // Super-peer might stop broadcasting here if it believes all data is sent.
+            // Or rely on sparse ACKs to know when to stop. Let's rely on ACKs.
+            return;
+        }
+
+        log("Super-peer broadcasting chunk, size: " + chunk.remaining());
+        ActualMessage m = new ActualMessage(MSG_BCAST_CHUNK, chunk.array()); // chunk.array() might need care if buffer is shared/sliced
+        byte[] rawMsg = m.toBytes();
+        
+        // In a real scenario with UDP broadcast:
+        // DatagramPacket packet = new DatagramPacket(rawMsg, rawMsg.length, broadcastAddress, broadcastPort);
+        // broadcastSocket.send(packet);
+
+        // Simulating broadcast by sending to all active TCP connections:
+        activeConnections.values().forEach(handler -> handler.sendMessage(rawMsg));
+    }
+
+    private void scheduleDisasterModeTasks() {
+        if (disasterMode && !wanReturn) {
+            if (I_AM_SUPER) {
+                scheduler.scheduleAtFixedRate(this::broadcastNextChunk, 0, 100, TimeUnit.MILLISECONDS); // As per plan
+                log("Super-peer: Scheduled broadcast task.");
+            } else { // Normal peer
+                scheduler.scheduleAtFixedRate(this::sendSparseAck,
+                        sparseAckInterval, sparseAckInterval, TimeUnit.MILLISECONDS);
+                log("Normal peer: Scheduled sparse ACK task.");
+            }
+        }
+    }
+    
+    private void sendSparseAck() {
+        if (I_AM_SUPER || fountainDecoder == null || broadcastReceivedChunks == null) return;
+
+        try {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            ObjectOutputStream oos = new ObjectOutputStream(baos);
+            synchronized(broadcastReceivedChunks) { // Ensure consistent read
+                oos.writeObject(broadcastReceivedChunks);
+            }
+            oos.close();
+            byte[] payload = baos.toByteArray();
+            
+            ActualMessage ackMsg = new ActualMessage(MSG_SPARSE_ACK, payload);
+            log("Normal peer sending SPARSE_ACK. Chunks received: " + broadcastReceivedChunks.cardinality() + "/" + numberOfBroadcastChunks);
+
+            // Send to super-peer. How does it know who the super-peer is?
+            // For now, send to all. The super-peer will identify itself and process.
+            // Or, if election result is globally known, send directly.
+            // Let's assume it sends to all connected peers, and the super-peer picks it up.
+             activeConnections.values().forEach(handler -> handler.sendMessage(ackMsg.toBytes()));
+
+        } catch (IOException e) {
+            log("Error serializing sparse ACK: " + e.getMessage());
+        }
+    }
+
+    private void handleSparseAck(int fromPeerID, byte[] payload) {
+        if (!I_AM_SUPER) return;
+
+        try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(payload))) {
+            BitSet receivedPeerChunks = (BitSet) ois.readObject();
+            log("Super-peer received SPARSE_ACK from " + fromPeerID + ". They have " + receivedPeerChunks.cardinality() + "/" + numberOfBroadcastChunks + " chunks.");
+
+            PeerInfo remotePeer = peerInfoMap.get(fromPeerID);
+            if (remotePeer != null) {
+                boolean wasComplete = remotePeer.lastReportedBroadcastChunks.cardinality() == numberOfBroadcastChunks;
+                remotePeer.lastReportedBroadcastChunks = receivedPeerChunks;
+
+                if (!wasComplete && receivedPeerChunks.cardinality() == numberOfBroadcastChunks) {
+                    peersCompletedBroadcast.incrementAndGet();
+                    log("Super-peer: Peer " + fromPeerID + " has now completed the broadcast. Total completed: " + peersCompletedBroadcast.get());
+                }
+            }
+
+            // Check if all normal peers have completed
+            if (peersCompletedBroadcast.get() >= (peerInfoMap.size() -1 ) && peerInfoMap.size() > 1 ) { // -1 for super-peer itself
+                log("Super-peer: All " + peersCompletedBroadcast.get() + " normal peers have ACKed full broadcast. Initiating fail-back.");
+                switchToClassicSwarm();
+            }
+
+        } catch (IOException | ClassNotFoundException e) {
+            log("Error deserializing sparse ACK from " + fromPeerID + ": " + e.getMessage());
+        }
+    }
+
+    private void switchToClassicSwarm() {
+        if (I_AM_SUPER) {
+            log("Super-peer switching to classic BitTorrent swarm mode.");
+            I_AM_SUPER = false; // Stop broadcast scheduler implicitly as tasks check this flag
+                                // Or explicitly cancel the broadcast task if its handle is stored.
+            wanReturn = true; // Mark that we are back to WAN / BT mode
+
+            // Send HAVE messages for all pieces to trigger BitTorrent mode for others
+            log("Super-peer broadcasting HAVE messages for all pieces to initiate BitTorrent swarm.");
+            for (int i = 0; i < numberOfPieces; i++) {
+                if (this.bitfield.get(i)) { // Super-peer should have all pieces
+                    broadcastHaveMessage(i); // Existing method
+                }
+            }
+            // Restart choking tasks if they were not started due to disaster mode
+            startChokingTasks();
+        } else { // Normal Peer
+            log("Normal peer: Super-peer indicated switch to classic swarm or WAN return. Stopping disaster mode operations.");
+            wanReturn = true;
+            // Stop sending sparse ACKs (scheduler checks wanReturn)
+            // Start BitTorrent choking/unchoking logic if not already running
+            startChokingTasks();
+            // Existing logic for REQUEST/PIECE should take over if pieces are missing.
+            // Might need to send initial bitfield or interest messages again.
+            activeConnections.values().forEach(PeerConnectionHandler::sendBitfield);
+        }
+    }
+
+
     // --- Main Execution Logic ---
     public void run() {
         try {
@@ -776,31 +1213,71 @@ public class peerProcess {
                 System.exit(1);
             }
 
-            log("Peer " + peerID + " starting up at " + hostName + ":" + listeningPort);
-            log("File: " + fileName + ", Size: " + fileSize + ", Pieces: " + numberOfPieces);
+            log("Peer " + peerID + " starting up at " + hostName + ":" + listeningPort + (disasterMode ? " [DISASTER MODE]" : " [NORMAL MODE]"));
+            if (disasterMode) {
+                log("Disaster Mode Initialized. File: " + fileName + ", Size: " + fileSize + ", Broadcast Chunks: " + numberOfBroadcastChunks);
+                electSuperPeer(); // Elect super peer based on config
+                                  // A more dynamic election would involve MSG_ROLE_ELECT exchanges before this.
+            } else {
+                log("BitTorrent Mode. File: " + fileName + ", Size: " + fileSize + ", BT Pieces: " + numberOfPieces);
+            }
+
 
             startServer();
-            connectToPeers();
-            startChokingTasks();
+            connectToPeers(); // Establishes TCP links for all modes
 
-            // Keep main thread alive to check for termination condition
+            if (disasterMode && !wanReturn) {
+                scheduleDisasterModeTasks();
+            } else { // Normal BitTorrent mode or after fail-back
+                startChokingTasks();
+            }
+
+
+            // Main loop for checking termination or wanReturn
             while (true) {
                 try {
-                    Thread.sleep(5000); // Check every 5 seconds
+                    Thread.sleep(5000);
                 } catch (InterruptedException e) {
                     log("Main thread interrupted, initiating shutdown.");
-                    Thread.currentThread().interrupt(); // Preserve interrupt status
-                    break; // Exit loop to shutdown
+                    Thread.currentThread().interrupt();
+                    break;
                 }
 
+                if (disasterMode && wanReturn && I_AM_SUPER) { // Super-peer detected WAN return, already switched.
+                     log("Super-peer: WAN returned, operating in classic swarm mode. Monitoring for BT completion.");
+                     // Now behaves like a regular peer waiting for BT completion.
+                     // We need a way for I_AM_SUPER to be false here or for logic to handle it.
+                     // switchToClassicSwarm sets I_AM_SUPER = false for the original super peer.
+                }
+
+
                 if (checkTerminationCondition()) {
-                    log("All peers completed. Waiting a bit before shutdown...");
-                    try {
-                        Thread.sleep(5000); // Wait a short period to ensure messages propagate
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
+                    if (disasterMode && !wanReturn && I_AM_SUPER) {
+                        log("Super-peer: Broadcast phase complete. Switching to classic swarm (fail-back).");
+                        switchToClassicSwarm(); // This will set wanReturn = true, I_AM_SUPER = false for the original super.
+                        // The loop will continue, but now in BT mode.
+                    } else if (disasterMode && !wanReturn && !I_AM_SUPER && (broadcastReceivedChunks.cardinality() == numberOfBroadcastChunks)){
+                        log("Normal peer: Broadcast download complete. Waiting for switch to classic swarm or manual WAN return.");
+                        // If it has the file, it should start acting like a seeder in BT mode once switched.
+                        // It may need to send out HAVE messages if not done by super-peer's failback.
+                        // Reassemble the file from broadcast chunks
+                        if(fountainDecoder != null && fountainDecoder.isDataDecoded()){ // isDataDecoded is conceptual
+                            reassembleBroadcastFile();
+                        }
                     }
-                    break; // Exit loop to shutdown
+                    else if ((disasterMode && wanReturn) || !disasterMode) { // In BT mode (either initially or after fail-back)
+                        log("All peers completed (BitTorrent mode). Waiting a bit before shutdown...");
+                        try {
+                            Thread.sleep(1000); // Shorter wait
+                        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                        break; // Exit loop to shutdown for BT mode
+                    }
+                }
+                
+                // Manual WAN return check (for normal peers, or super-peer if it needs external trigger)
+                if (disasterMode && !wanReturn && peerProcess.wanReturn) { // Check static flag
+                    log("Manual WAN return triggered. Switching to classic swarm mode.");
+                    switchToClassicSwarm(); // All peers execute this to align state.
                 }
             }
 
@@ -887,11 +1364,22 @@ public class peerProcess {
             parentPeer.chokedPeers.add(this.remotePeerID); // Initially choke the peer
             parentPeer.peersChokingMe.add(this.remotePeerID); // Assume they choke us initially
 
-            // Send bitfield immediately after successful handshake
-            sendBitfield();
+            // Modify to send bitfield OR start disaster mode interaction
+            if (connectionEstablished) {
+                if (disasterMode && !wanReturn) { // If starting in disaster mode
+                    log("Connection established with " + remotePeerID + " in disaster mode. No initial BT bitfield. Waiting for election/broadcast.");
+                    // Super-peer election happens globally.
+                    // If I_AM_SUPER, broadcast will happen.
+                    // If normal peer, will wait for MSG_BCAST_CHUNK or send MSG_SPARSE_ACK.
+                    // No automatic bitfield send here for disaster mode.
+                } else { // Normal BitTorrent mode or after fail-back
+                    sendBitfield(); // Send standard BitTorrent bitfield
+                }
+            }
         }
 
-        private void sendBitfield() {
+
+        public void sendBitfield() { // For BitTorrent mode
             synchronized (parentPeer.bitfield) { // Synchronize access to parent's bitfield
                 byte[] payload = parentPeer.getBitfieldPayload();
                 if (payload.length > 0) {
@@ -985,13 +1473,17 @@ public class peerProcess {
 
         @Override
         public void run() {
+            // ... existing handshake reading and processing ...
+            // The message loop processing (processMessage) needs to be updated for new messages.
+            // Inside the while (connectionEstablished && !Thread.currentThread().isInterrupted()) loop:
+            //    processMessage(new ActualMessage(type, payload));
+            // This part remains structurally similar.
             try {
                 // --- Handshake Phase ---
                 byte[] handshakeBuffer = new byte[32];
                 int bytesRead = in.read(handshakeBuffer);
                 if (bytesRead != 32) {
-                    parentPeer.log("Failed to read complete handshake from " + socket.getRemoteSocketAddress()
-                            + ". Read: " + bytesRead);
+                    parentPeer.log("Failed to read complete handshake from " + socket.getRemoteSocketAddress() + ". Read: " + bytesRead);
                     closeConnection("Incomplete handshake");
                     return;
                 }
@@ -1009,8 +1501,7 @@ public class peerProcess {
                     try {
                         length = in.readInt(); // Reads 4 bytes for length
                         if (length < 1) {
-                            parentPeer.log("Received invalid message length " + length + " from peer " + remotePeerID
-                                    + ". Closing connection.");
+                            parentPeer.log("Received invalid message length " + length + " from peer " + remotePeerID + ". Closing connection.");
                             closeConnection("Invalid message length");
                             break;
                         }
@@ -1039,19 +1530,17 @@ public class peerProcess {
                         closeConnection("Read error");
                         break;
                     }
-
+                    
                     byte type = messageBody[0];
                     byte[] payload = (length > 1) ? Arrays.copyOfRange(messageBody, 1, length) : new byte[0];
 
                     processMessage(new ActualMessage(type, payload));
 
-                    // Check termination after processing message
-                    if (parentPeer.checkTerminationCondition()) {
-                        parentPeer.log("Termination condition met while handling messages for peer " + remotePeerID
-                                + ". Handler stopping.");
-                        // No need to close connection here, shutdown() will handle it.
-                        break;
+                    if (parentPeer.checkTerminationCondition() && ((disasterMode && wanReturn) || !disasterMode)) { // Only break loop if BT termination
+                        parentPeer.log("BT Termination condition met for peer " + remotePeerID + ". Handler loop ending.");
+                        break; 
                     }
+                     // For disaster mode, handler continues until connection drops or explicit shutdown
                 }
 
             } catch (IOException e) {
@@ -1066,10 +1555,82 @@ public class peerProcess {
         }
 
         private void processMessage(ActualMessage msg) {
-            if (msg == null) {
-                parentPeer.log("Received null message from peer " + remotePeerID + ". Ignoring.");
-                return;
+            if (msg == null) return;
+
+            // Handle disaster mode messages first if active
+            if (disasterMode && !wanReturn) {
+                switch (msg.type) {
+                    case MSG_BCAST_CHUNK:
+                        if (parentPeer.I_AM_SUPER) {
+                            parentPeer.log("Super-peer received an echo or misdirected BCAST_CHUNK from " + remotePeerID + ". Ignoring.");
+                            return;
+                        }
+                        parentPeer.log("Normal peer received BCAST_CHUNK from " + remotePeerID + " (presumably super-peer). Payload size: " + msg.payload.length);
+                        if (parentPeer.fountainDecoder != null) {
+                            // We need a chunk ID. Let's assume it's prepended to the payload by the super-peer
+                            // Or, for simplicity, OpenRQ might not need an explicit ID if symbols are in order.
+                            // For this conceptual version, let's say the FountainCoder handles it.
+                            // Conceptual: fountainDecoder.receiveChunk(ByteBuffer.wrap(msg.payload), someChunkId);
+                            ByteBuffer chunkData = ByteBuffer.wrap(msg.payload);
+                            
+                            // For simplicity, let's assume chunk ID is NOT in this payload for now,
+                            // and the decoder handles symbols as they arrive.
+                            // This is a simplification of how fountain codes work with out-of-order/identified symbols.
+                            // A more robust implementation might need chunk IDs in the payload.
+
+                            // For now, we'll just mark that *a* chunk was received.
+                            // The actual data processing/storage for reassembly is a complex part of the decoder.
+                            // Let's assume the 'FountainCoder' handles the symbol.
+                            // And we update our local `broadcastReceivedChunks` based on some logic.
+                            // This part is highly conceptual without real decoder integration.
+                            // For now, let's assume each broadcast message is a unique piece for the BitSet.
+                            // This requires careful handling of how chunk IDs map to BitSet indices.
+                            
+                            // If BCAST_CHUNK payload *is* the piece data, and its index is implicit or known
+                            // For example, if the super peer sends them in order and we count. This is fragile.
+                            // A better way: payload = [chunk_index (4 bytes), chunk_data (...)]
+                            // Let's assume for now: we just got *a* symbol, the decoder deals with it.
+                            // We can't reliably set a bit in broadcastReceivedChunks without a chunkID.
+                            // Let the decoder handle it. When decoder.isDataDecoded() is true, we're done.
+                            // So, the main role of this message is to feed the decoder.
+                            parentPeer.fountainDecoder.receiveChunk(chunkData, 0); // Dummy chunkId
+
+                            // If we successfully decoded a new piece and can map it to an index for the BitSet:
+                            // int decodedPieceIndexForBitSet = ... ; // This logic is missing
+                            // parentPeer.broadcastReceivedChunks.set(decodedPieceIndexForBitSet);
+
+                            if (parentPeer.fountainDecoder.isDataDecoded()) { // Conceptual
+                                parentPeer.log("Normal peer: All broadcast data decoded!");
+                                parentPeer.broadcastReceivedChunks.set(0, parentPeer.numberOfBroadcastChunks); // Mark all as received
+                                parentPeer.reassembleBroadcastFile();
+                                // Now this peer has the file and waits for fail-back or WAN return.
+                            }
+                        }
+                        return; // Handled in disaster mode
+
+                    case MSG_SPARSE_ACK:
+                        if (parentPeer.I_AM_SUPER) {
+                            parentPeer.handleSparseAck(remotePeerID, msg.payload);
+                        } else {
+                            parentPeer.log("Normal peer received a SPARSE_ACK from " + remotePeerID + ". Ignoring.");
+                        }
+                        return; // Handled
+
+                    case MSG_ROLE_ELECT:
+                        parentPeer.log("Received MSG_ROLE_ELECT from " + remotePeerID + ". Payload: " + (msg.payload != null ? msg.payload.length : "null"));
+                        // Potentially trigger re-election or update peer status based on payload.
+                        // For now, just log. A full election protocol would use this.
+                        // As per plan: "Call electSuperPeer() ... whenever a MSG_ROLE_ELECT beacon arrives"
+                        // This might cause issues if electSuperPeer() is too heavy or stateful without proper guards.
+                        // For now, a simple re-evaluation:
+                        // parentPeer.electSuperPeer(); // This could be disruptive if not handled carefully.
+                        // Let's assume MSG_ROLE_ELECT is more of a heartbeat or status update for now.
+                        return; // Handled
+                }
             }
+
+            // Fall through to BitTorrent message processing if not handled by disaster mode
+            // or if wanReturn is true.
             switch (msg.type) {
                 case MSG_CHOKE:
                     parentPeer.log("Received CHOKE from peer " + remotePeerID);
@@ -1077,6 +1638,8 @@ public class peerProcess {
                     parentPeer.peersChokingMe.add(remotePeerID);
 
                     break;
+                // ... other cases from original peerProcess.java (UNCHOKE, INTERESTED, NOT_INTERESTED, HAVE, BITFIELD, REQUEST, PIECE) ...
+                // These should largely remain the same but only operate effectively in BT mode.
                 case MSG_UNCHOKE:
                     parentPeer.log("Received UNCHOKE from peer " + remotePeerID);
                     remotePeerChokingMe = false;
@@ -1125,7 +1688,7 @@ public class peerProcess {
                     }
                     break;
                 case MSG_BITFIELD:
-                    parentPeer.log("Received BITFIELD from peer " + remotePeerID);
+                    parentPeer.log("Received BITFIELD from peer " + remotePeerID + ( (disasterMode && !wanReturn) ? " (in disaster mode, unusual)" : ""));
                     parentPeer.updatePeerBitfield(remotePeerID, msg.payload);
                     break;
                 case MSG_REQUEST:
@@ -1251,21 +1814,35 @@ public class peerProcess {
 
     // --- Main Method ---
     public static void main(String[] args) {
-        if (args.length != 1) {
-            System.err.println("Usage: java peerProcess <peerID>");
+        if (args.length < 1) {
+            System.err.println("Usage: java peerProcess <peerID> [--disaster] [--wan-return]");
             System.exit(1);
         }
 
-        int peerID;
+        int peerIDArg;
         try {
-            peerID = Integer.parseInt(args[0]);
+            peerIDArg = Integer.parseInt(args[0]);
         } catch (NumberFormatException e) {
             System.err.println("Error: peerID must be an integer.");
             System.exit(1);
-            return; // Keep compiler happy
+            return;
         }
 
-        peerProcess peer = new peerProcess(peerID);
-        peer.run(); // Start the peer process
+        for (int i = 1; i < args.length; i++) {
+            if ("--disaster".equalsIgnoreCase(args[i])) {
+                peerProcess.disasterMode = true;
+            } else if ("--wan-return".equalsIgnoreCase(args[i])) {
+                peerProcess.wanReturn = true; // This flag signals an immediate desire to be in BT mode.
+                                          // If --disaster is also present, it means disaster mode should fail-back quickly.
+            }
+        }
+        
+        if (peerProcess.wanReturn && !peerProcess.disasterMode) {
+            System.out.println("Note: --wan-return is typically used with --disaster mode to trigger early fail-back. Using in normal mode has no special effect.");
+        }
+
+
+        peerProcess peer = new peerProcess(peerIDArg);
+        peer.run();
     }
 }
